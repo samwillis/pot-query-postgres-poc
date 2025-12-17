@@ -365,19 +365,20 @@ electric_snapshot_assign_hook(const char *newval, void *extra)
 	}
 
 	/*
-	 * Install immediately. We intentionally do not support changing it again
-	 * later in the transaction.
+	 * Build and remember a synthetic snapshot for the remainder of the current
+	 * transaction. PostgreSQL 16 does not expose the internal "FirstXactSnapshot"
+	 * symbol to extensions, so we apply the snapshot at ExecutorStart for each
+	 * statement in this transaction instead of trying to mutate internal globals.
+	 *
+	 * Guardrails (enforced in the check hook) ensure this is set before the first
+	 * statement fixes the transaction snapshot, and only for xact-snapshot
+	 * isolation levels.
 	 */
 	{
-		Snapshot base = NULL;
-		Snapshot snap = NULL;
-
-		/* Validate guardrails, then get a fully-initialized base snapshot. */
-		base = electric_ensure_txn_allows_synthetic_snapshot();
-		snap = electric_build_snapshot_from_parts(base, parsed);
+		Snapshot base = electric_ensure_txn_allows_synthetic_snapshot();
+		Snapshot snap = electric_build_snapshot_from_parts(base, parsed);
 		pending_snapshot = snap;
-		snapshot_pending_install = false;
-		FirstXactSnapshot = snap;
+		snapshot_pending_install = true;
 	}
 }
 
@@ -385,14 +386,40 @@ static void
 electric_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	/*
-	 * Fallback hook: currently we install at SET time. Keep this hook in place
-	 * as a safety net for future refactors where install is deferred.
+	 * If SET LOCAL electric.snapshot was set for this transaction, run this
+	 * statement under the synthetic MVCC snapshot.
+	 *
+	 * We do this by overriding the QueryDesc snapshot before the standard
+	 * ExecutorStart captures it into the executor state / active snapshot stack.
 	 */
-	if (snapshot_pending_install && pending_snapshot != NULL && !FirstSnapshotSet)
+	if (pending_snapshot != NULL)
 	{
-		(void) electric_ensure_txn_allows_synthetic_snapshot();
-		FirstXactSnapshot = pending_snapshot;
-		snapshot_pending_install = false;
+		/* Ensure users can't use this for writes in this POC. */
+		if (queryDesc != NULL && queryDesc->operation != CMD_SELECT)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("electric.snapshot only supports SELECT statements in this POC")));
+
+		if (queryDesc != NULL)
+		{
+			/*
+			 * The snapshot stored in QueryDesc is normally registered to the
+			 * portal's resource owner during CreateQueryDesc(). If we replace it,
+			 * we must unregister the original and register our replacement, or
+			 * PostgreSQL will error when cleaning up snapshots.
+			 */
+			if (queryDesc->snapshot != NULL)
+				UnregisterSnapshot(queryDesc->snapshot);
+
+			queryDesc->snapshot = RegisterSnapshot(pending_snapshot);
+		}
+
+		/*
+		 * Keep snapshot_pending_install true so it applies to subsequent
+		 * statements within the same transaction; it will be cleared at
+		 * COMMIT/ABORT via the xact callback.
+		 */
+		snapshot_pending_install = true;
 	}
 
 	if (prev_ExecutorStart)

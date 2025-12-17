@@ -378,7 +378,9 @@ describe('electric_exec_as_of', () => {
 
       // Point-in-time read using SET LOCAL (no wrapper)
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
-      await client.query(`SET LOCAL electric.snapshot = $1`, [snapshot1]);
+      // SET LOCAL must run before the first SELECT in the transaction
+      // (and SET doesn't accept $1-style parameters), so we inline the snapshot.
+      await client.query(`SET LOCAL electric.snapshot = '${snapshot1}'`);
       const asOf = await client.query(
         `SELECT allowed FROM acl WHERE user_id = 'u1' AND doc_id = 'd1'`
       );
@@ -392,7 +394,7 @@ describe('electric_exec_as_of', () => {
       await client.query('SELECT 1');
 
       await expect(
-        client.query(`SET LOCAL electric.snapshot = $1`, [snapshot1])
+        client.query(`SET LOCAL electric.snapshot = '${snapshot1}'`)
       ).rejects.toThrow(/must be set before the first query/i);
 
       await client.query('ROLLBACK');
@@ -402,7 +404,7 @@ describe('electric_exec_as_of', () => {
       await client.query('BEGIN'); // default: READ COMMITTED
 
       await expect(
-        client.query(`SET LOCAL electric.snapshot = $1`, [snapshot1])
+        client.query(`SET LOCAL electric.snapshot = '${snapshot1}'`)
       ).rejects.toThrow(/requires repeatable read|serializable/i);
 
       await client.query('ROLLBACK');
