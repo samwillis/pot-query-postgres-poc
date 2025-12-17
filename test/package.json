@@ -1,0 +1,23 @@
+{
+  "name": "electric-snapshot-poc-tests",
+  "version": "0.0.1",
+  "description": "Integration tests for electric_poc Postgres extension",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build:docker": "cd .. && docker build -f docker/Dockerfile -t electric-postgres:test ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "pg": "^8.13.1",
+    "pg-logical-replication": "^2.1.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "optionalDependencies": {
+    "@testcontainers/postgresql": "^10.18.0",
+    "testcontainers": "^10.18.0"
+  }
+}
