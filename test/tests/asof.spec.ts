@@ -326,4 +326,96 @@ describe('electric_exec_as_of', () => {
       }
     }, 120000);
   });
+
+  describe('Test 5 - SET LOCAL electric.snapshot', () => {
+    let replicationState: ReplicationState;
+    let snapshot1: string;
+
+    beforeAll(async () => {
+      // Ensure a known starting state
+      await client.query(`UPDATE acl SET allowed = true WHERE user_id = 'u1' AND doc_id = 'd1'`);
+
+      // Setup replication
+      await setupReplication(client);
+
+      // Start replication stream
+      replicationState = await startReplicationStream(pgConfig.connectionString);
+
+      // Clear any existing commits from previous tests
+      const initialCommitCount = replicationState.commitSnapshots.length;
+
+      // Tx1: Set allowed to false
+      await client.query('BEGIN');
+      await client.query(`UPDATE acl SET allowed = false WHERE user_id = 'u1' AND doc_id = 'd1'`);
+      await client.query('COMMIT');
+
+      // Wait for Tx1 commit in replication stream
+      const commit1 = await waitForNthCommit(replicationState, initialCommitCount + 1, 15000);
+      snapshot1 = commit1.snapshotString;
+
+      // Tx2: Set allowed back to true (latest state)
+      await client.query('BEGIN');
+      await client.query(`UPDATE acl SET allowed = true WHERE user_id = 'u1' AND doc_id = 'd1'`);
+      await client.query('COMMIT');
+
+      // Wait for Tx2 commit
+      await waitForNthCommit(replicationState, initialCommitCount + 2, 15000);
+    }, 60000);
+
+    afterAll(async () => {
+      if (replicationState) {
+        await stopReplicationStream(replicationState);
+      }
+      await cleanupReplication(client);
+    });
+
+    it('should apply snapshot to subsequent normal SELECT', async () => {
+      // Verify current value is now true (latest)
+      const currentValue = await client.query(
+        `SELECT allowed FROM acl WHERE user_id = 'u1' AND doc_id = 'd1'`
+      );
+      expect(currentValue.rows[0].allowed).toBe(true);
+
+      // Point-in-time read using SET LOCAL (no wrapper)
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+      await client.query(`SET LOCAL electric.snapshot = $1`, [snapshot1]);
+      const asOf = await client.query(
+        `SELECT allowed FROM acl WHERE user_id = 'u1' AND doc_id = 'd1'`
+      );
+      await client.query('COMMIT');
+
+      expect(asOf.rows[0].allowed).toBe(false);
+    });
+
+    it('should error if setting snapshot after first query in transaction', async () => {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+      await client.query('SELECT 1');
+
+      await expect(
+        client.query(`SET LOCAL electric.snapshot = $1`, [snapshot1])
+      ).rejects.toThrow(/must be set before the first query/i);
+
+      await client.query('ROLLBACK');
+    });
+
+    it('should error on wrong isolation level (READ COMMITTED)', async () => {
+      await client.query('BEGIN'); // default: READ COMMITTED
+
+      await expect(
+        client.query(`SET LOCAL electric.snapshot = $1`, [snapshot1])
+      ).rejects.toThrow(/requires repeatable read|serializable/i);
+
+      await client.query('ROLLBACK');
+    });
+
+    it('should error on malformed snapshot', async () => {
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+
+      await expect(
+        client.query(`SET LOCAL electric.snapshot = 'not-a-snapshot'`)
+      ).rejects.toThrow(/malformed snapshot/i);
+
+      await client.query('ROLLBACK');
+    });
+  });
 });

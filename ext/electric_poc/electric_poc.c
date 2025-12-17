@@ -15,6 +15,8 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "access/xact.h"
+#include "executor/executor.h"
+#include "utils/guc.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -23,6 +25,410 @@
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(electric_exec_as_of);
+
+/*
+ * SET LOCAL electric.snapshot support (POC)
+ *
+ * Installs a synthetic MVCC snapshot for the remainder of the current
+ * transaction (REPEATABLE READ / SERIALIZABLE only), provided it is set before
+ * the first snapshot is fixed for the transaction.
+ *
+ * Snapshot text format: xmin:xmax:xip1,xip2,... (xip list may be empty).
+ * Subxids are intentionally not supported in this POC.
+ */
+static char *electric_snapshot_guc = NULL;
+static Snapshot pending_snapshot = NULL;
+static bool snapshot_pending_install = false;
+
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+
+typedef struct ElectricParsedSnapshot
+{
+	TransactionId xmin;
+	TransactionId xmax;
+	TransactionId *xip;
+	uint32 xcnt;
+} ElectricParsedSnapshot;
+
+static int
+txid_cmp(const void *a, const void *b)
+{
+	TransactionId ta = *(const TransactionId *) a;
+	TransactionId tb = *(const TransactionId *) b;
+	if (ta < tb)
+		return -1;
+	if (ta > tb)
+		return 1;
+	return 0;
+}
+
+static void
+electric_clear_pending_snapshot(void)
+{
+	pending_snapshot = NULL;
+	snapshot_pending_install = false;
+}
+
+static void
+electric_xact_callback(XactEvent event, void *arg)
+{
+	(void) arg;
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PARALLEL_ABORT:
+		case XACT_EVENT_PREPARE:
+			electric_clear_pending_snapshot();
+			break;
+		default:
+			break;
+	}
+}
+
+/*
+ * Parse pg_snapshot-like text into parts (xmin:xmax:xip_list).
+ * Allocates the parsed xip array in TopTransactionContext.
+ */
+static ElectricParsedSnapshot *
+electric_parse_snapshot_text(const char *snapshot_str)
+{
+	ElectricParsedSnapshot *parsed;
+	char *str_copy;
+	char *saveptr = NULL;
+	char *token;
+	char *xip_str;
+	char *endptr;
+	TransactionId xmin;
+	TransactionId xmax;
+	TransactionId *xip = NULL;
+	uint32 xcnt = 0;
+	uint32 xip_alloc = 0;
+	char *p;
+
+	if (snapshot_str == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("malformed snapshot: NULL")));
+
+	str_copy = pstrdup(snapshot_str);
+
+	/* xmin */
+	token = strtok_r(str_copy, ":", &saveptr);
+	if (token == NULL || token[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("malformed snapshot: missing xmin")));
+	endptr = NULL;
+	xmin = (TransactionId) strtoul(token, &endptr, 10);
+	if (endptr == NULL || *endptr != '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("malformed snapshot: invalid xmin")));
+
+	/* xmax */
+	token = strtok_r(NULL, ":", &saveptr);
+	if (token == NULL || token[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("malformed snapshot: missing xmax")));
+	endptr = NULL;
+	xmax = (TransactionId) strtoul(token, &endptr, 10);
+	if (endptr == NULL || *endptr != '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("malformed snapshot: invalid xmax")));
+
+	/* xip list (may be empty string) */
+	xip_str = strtok_r(NULL, ":", &saveptr);
+	/*
+	 * Note: For strings like "xmin:xmax:" a trailing ':' results in no third
+	 * token from strtok_r(). Treat that as an empty xip list for compatibility
+	 * with our logical-replication-derived snapshot strings.
+	 */
+	if (xip_str == NULL)
+		xip_str = "";
+
+	/* No extra ':' parts allowed (beyond xmin, xmax, xip_list). */
+	if (strtok_r(NULL, ":", &saveptr) != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("malformed snapshot: too many ':'-separated parts")));
+
+	if (xmin > xmax)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("malformed snapshot: xmin must be <= xmax")));
+
+	if (xip_str[0] != '\0')
+	{
+		/* Count commas to estimate array size */
+		xip_alloc = 1;
+		for (p = xip_str; *p; p++)
+			if (*p == ',')
+				xip_alloc++;
+
+		xip = (TransactionId *) MemoryContextAlloc(TopTransactionContext,
+												  xip_alloc * sizeof(TransactionId));
+
+		{
+			char *xip_copy = pstrdup(xip_str);
+			char *xip_saveptr = NULL;
+			char *xip_token = strtok_r(xip_copy, ",", &xip_saveptr);
+
+			while (xip_token != NULL)
+			{
+				TransactionId xid;
+
+				if (xip_token[0] == '\0')
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("malformed snapshot: empty xid in xip list")));
+
+				endptr = NULL;
+				xid = (TransactionId) strtoul(xip_token, &endptr, 10);
+				if (endptr == NULL || *endptr != '\0')
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("malformed snapshot: invalid xid in xip list")));
+
+				if (xid < xmin || xid >= xmax)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("malformed snapshot: xip xid out of range")));
+
+				xip[xcnt++] = xid;
+				xip_token = strtok_r(NULL, ",", &xip_saveptr);
+			}
+
+			pfree(xip_copy);
+		}
+	}
+
+	pfree(str_copy);
+
+	/* Ensure xip is sorted and unique (required by snapshot visibility logic). */
+	if (xcnt > 1)
+	{
+		uint32 i;
+		qsort(xip, xcnt, sizeof(TransactionId), txid_cmp);
+		for (i = 1; i < xcnt; i++)
+		{
+			if (xip[i] == xip[i - 1])
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("malformed snapshot: duplicate xid in xip list")));
+		}
+	}
+
+	parsed = (ElectricParsedSnapshot *) MemoryContextAlloc(TopTransactionContext,
+														  sizeof(ElectricParsedSnapshot));
+	parsed->xmin = xmin;
+	parsed->xmax = xmax;
+	parsed->xip = xip;
+	parsed->xcnt = xcnt;
+	return parsed;
+}
+
+/*
+ * Create a SnapshotData by copying a base snapshot and overriding MVCC fields.
+ * Allocates in TopTransactionContext.
+ */
+static Snapshot
+electric_build_snapshot_from_parts(Snapshot base, const ElectricParsedSnapshot *parsed)
+{
+	Snapshot snap;
+	Size size;
+
+	if (base == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("internal error: base snapshot is NULL")));
+
+	size = sizeof(SnapshotData) + (parsed->xcnt * sizeof(TransactionId));
+	snap = (Snapshot) MemoryContextAllocZero(TopTransactionContext, size);
+
+	memcpy(snap, base, sizeof(SnapshotData));
+	snap->snapshot_type = SNAPSHOT_MVCC;
+	snap->xmin = parsed->xmin;
+	snap->xmax = parsed->xmax;
+	snap->xcnt = parsed->xcnt;
+	snap->copied = true;
+	snap->active_count = 0;
+	snap->regd_count = 0;
+
+	if (parsed->xcnt > 0)
+	{
+		snap->xip = (TransactionId *) ((char *) snap + sizeof(SnapshotData));
+		memcpy(snap->xip, parsed->xip, parsed->xcnt * sizeof(TransactionId));
+	}
+	else
+	{
+		snap->xip = NULL;
+	}
+
+	/* POC: we don't track subxids */
+	snap->subxip = NULL;
+	snap->subxcnt = 0;
+	snap->suboverflowed = false;
+
+	return snap;
+}
+
+static Snapshot
+electric_ensure_txn_allows_synthetic_snapshot(void)
+{
+	/*
+	 * Guardrails:
+	 * - Must be inside an explicit transaction block (BEGIN ...).
+	 * - Must use a transaction snapshot (REPEATABLE READ or SERIALIZABLE).
+	 * - Must be before the first snapshot is fixed for the transaction.
+	 * - Must not be inside a subtransaction.
+	 */
+	if (!IsTransactionBlock())
+		ereport(ERROR,
+				(errcode(ERRCODE_NO_ACTIVE_SQL_TRANSACTION),
+				 errmsg("electric.snapshot can only be set inside an explicit transaction block"),
+				 errhint("Use: BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL electric.snapshot = '...';")));
+
+	if (!IsolationUsesXactSnapshot())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("electric.snapshot requires REPEATABLE READ or SERIALIZABLE isolation level"),
+				 errhint("Use: BEGIN ISOLATION LEVEL REPEATABLE READ;")));
+
+	if (IsSubTransaction())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("electric.snapshot cannot be set inside a subtransaction")));
+
+	if (FirstSnapshotSet)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("electric.snapshot must be set before the first query in the transaction")));
+
+	/* Establish the transaction snapshot now (safe here because we validated FirstSnapshotSet first). */
+	return GetTransactionSnapshot();
+}
+
+static bool
+electric_snapshot_check_hook(char **newval, void **extra, GucSource source)
+{
+	(void) source;
+
+	if (newval == NULL || *newval == NULL)
+		return true;
+
+	if ((*newval)[0] == '\0')
+	{
+		*extra = NULL;
+		return true;
+	}
+
+	/* Enforce transactional guardrails at SET time. */
+	if (!IsTransactionBlock())
+		ereport(ERROR,
+				(errcode(ERRCODE_NO_ACTIVE_SQL_TRANSACTION),
+				 errmsg("electric.snapshot can only be set inside an explicit transaction block")));
+
+	if (!IsolationUsesXactSnapshot())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("electric.snapshot requires REPEATABLE READ or SERIALIZABLE isolation level")));
+
+	if (IsSubTransaction())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("electric.snapshot cannot be set inside a subtransaction")));
+
+	if (FirstSnapshotSet)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("electric.snapshot must be set before the first query in the transaction")));
+
+	/* Validate format and parse */
+	*extra = (void *) electric_parse_snapshot_text(*newval);
+	return true;
+}
+
+static void
+electric_snapshot_assign_hook(const char *newval, void *extra)
+{
+	ElectricParsedSnapshot *parsed = (ElectricParsedSnapshot *) extra;
+
+	/* Clear */
+	if (newval == NULL || newval[0] == '\0')
+	{
+		electric_clear_pending_snapshot();
+		return;
+	}
+
+	/*
+	 * Install immediately. We intentionally do not support changing it again
+	 * later in the transaction.
+	 */
+	{
+		Snapshot base = NULL;
+		Snapshot snap = NULL;
+
+		/* Validate guardrails, then get a fully-initialized base snapshot. */
+		base = electric_ensure_txn_allows_synthetic_snapshot();
+		snap = electric_build_snapshot_from_parts(base, parsed);
+		pending_snapshot = snap;
+		snapshot_pending_install = false;
+		FirstXactSnapshot = snap;
+	}
+}
+
+static void
+electric_ExecutorStart(QueryDesc *queryDesc, int eflags)
+{
+	/*
+	 * Fallback hook: currently we install at SET time. Keep this hook in place
+	 * as a safety net for future refactors where install is deferred.
+	 */
+	if (snapshot_pending_install && pending_snapshot != NULL && !FirstSnapshotSet)
+	{
+		(void) electric_ensure_txn_allows_synthetic_snapshot();
+		FirstXactSnapshot = pending_snapshot;
+		snapshot_pending_install = false;
+	}
+
+	if (prev_ExecutorStart)
+		prev_ExecutorStart(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
+}
+
+void
+_PG_init(void)
+{
+	DefineCustomStringVariable(
+		"electric.snapshot",
+		"Install a synthetic MVCC snapshot for this transaction (POC).",
+		"Set before the first query in a REPEATABLE READ / SERIALIZABLE transaction. "
+		"Format: xmin:xmax:xip1,xip2,... (xip may be empty).",
+		&electric_snapshot_guc,
+		"",
+		PGC_USERSET,
+		0,
+		electric_snapshot_check_hook,
+		electric_snapshot_assign_hook,
+		NULL
+	);
+
+	RegisterXactCallback(electric_xact_callback, NULL);
+
+	prev_ExecutorStart = ExecutorStart_hook;
+	ExecutorStart_hook = electric_ExecutorStart;
+}
+
+void
+_PG_fini(void)
+{
+	ExecutorStart_hook = prev_ExecutorStart;
+}
 
 /*
  * Check if the SQL starts with SELECT
