@@ -311,6 +311,32 @@ SELECT electric_exec_as_of(
 - Malformed snapshot strings cause errors
 - Only text parameters are supported (bound as `TEXTOID`)
 
+### `SET LOCAL electric.snapshot = '<pg_snapshot text>'` (transaction-scoped mode)
+
+Install a **synthetic MVCC snapshot for the rest of the current transaction**, so you can run **normal SQL** (no wrapper) under that point-in-time view.
+
+**Usage:**
+
+```sql
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SET LOCAL electric.snapshot = 'xmin:xmax:xip1,xip2,...'; -- xip list may be empty
+SELECT ...;  -- runs under the synthetic snapshot
+COMMIT;
+```
+
+**Important guardrails (enforced by the extension):**
+
+- **Must be inside an explicit transaction block** (`BEGIN ...`, not autocommit).
+- **Isolation level must be** `REPEATABLE READ` **or** `SERIALIZABLE` (i.e. uses a transaction snapshot).
+- **Must be set before the first query** in the transaction (before PostgreSQL fixes the transaction snapshot).
+- **Not supported in subtransactions** (e.g. after `SAVEPOINT`) in this POC.
+- Set `''` (empty string) to clear: `SET LOCAL electric.snapshot = ''`.
+
+**Notes:**
+
+- Snapshot format is `pg_snapshot`-style text: `xmin:xmax:xip_list`. Subxids are not tracked in this POC.
+- This implementation touches PostgreSQL snapshot internals and is **version-sensitive**; it’s intended for a POC.
+
 ## Limitations
 
 This is a proof-of-concept with known limitations:
