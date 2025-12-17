@@ -1,91 +1,245 @@
 # Electric Snapshot POC
 
-A proof-of-concept demonstrating "point-in-time" reads in Postgres using synthetic MVCC snapshots derived from logical replication (WAL tailing).
+A proof-of-concept demonstrating "point-in-time" reads in PostgreSQL using synthetic MVCC snapshots derived from logical replication (WAL tailing). This enables querying the database as-of a specific commit, even after subsequent commits have modified the data.
 
-## Overview
+## What This POC Proves
 
-This POC implements a Postgres C extension that allows executing read-only queries under a specific MVCC snapshot, enabling you to query the database as-of approximately a specific commit, even after later commits have occurred.
+### Core Hypothesis Validated ✅
 
-This is useful for ElectricSQL-style sync/auth validation: when observing commits in a logical replication stream, you can query Postgres as-of that commit for validation purposes.
+**We can execute read-only queries against historical database states by:**
+1. Observing transaction commits via logical replication (WAL tailing)
+2. Computing MVCC snapshot identifiers at each commit point
+3. Using those snapshots to query PostgreSQL and retrieve the exact data that existed at that point in time
 
-## Components
+### Evidence: Physical Tuple Examination
 
-### C Extension (`ext/electric_poc`)
+The `vacuum-proof.spec.ts` test provides **definitive proof** by examining PostgreSQL's physical heap storage:
 
-Provides the SQL function:
-
-```sql
-electric_exec_as_of(snapshot pg_snapshot, sql text, args jsonb DEFAULT '[]') RETURNS jsonb
+```
+Heap page contains 11 tuple versions
+Old (dead) tuple versions in heap: 10
 ```
 
-- Executes a read-only SELECT under the supplied MVCC snapshot
-- Returns results as JSON array
-- Only allows SELECT queries (validates query prefix)
-- Supports parameterized queries with `$1`, `$2`, etc. placeholders
-- Args are passed as a JSON array of strings
+Using the `pageinspect` extension, we can see the actual heap page contents:
 
-**Example usage:**
+```
+ lp | t_ctid | t_xmin | t_xmax | data (decoded)
+----+--------+--------+--------+------------------
+  1 | (0,2)  |    852 |    853 | "initial data"
+  2 | (0,3)  |    853 |    854 | "data version 1"
+  3 | (0,4)  |    854 |    855 | "data version 2"
+  ...
+ 11 | (0,11) |    862 |      0 | "data version 10"
+```
+
+This proves:
+- **11 physical tuple versions** exist in the heap for the same logical row
+- **10 are "dead" versions** (superseded by updates, with `t_xmax > 0`)
+- Each version contains the **actual historical data**
+- Our queries read these **real old tuples**, not just transaction ID tricks
+
+### Key Test: "As-Of Hides Later Commit"
+
+```typescript
+// 1. Tx1: Set allowed=false, capture snapshot1
+await client.query(`UPDATE acl SET allowed = false WHERE ...`);
+// snapshot1 = "762:762:"
+
+// 2. Tx2: Set allowed=true  
+await client.query(`UPDATE acl SET allowed = true WHERE ...`);
+
+// 3. Current query returns TRUE (the new value)
+const current = await client.query(`SELECT allowed FROM acl`);
+expect(current.rows[0].allowed).toBe(true);
+
+// 4. As-of query with snapshot1 returns FALSE (the old value!)
+const asOf = await client.query(`
+  SELECT electric_exec_as_of($1::pg_snapshot, 'SELECT allowed FROM acl', '[]')
+`, [snapshot1]);
+expect(asOf.rows[0].electric_exec_as_of[0].allowed).toBe(false);
+```
+
+## How It Works
+
+### 1. Logical Replication Stream (WAL Tailing)
+
+We use `pg-logical-replication` to consume the PostgreSQL logical replication stream:
+
+```typescript
+service.on('data', (lsn, message) => {
+  if (message.tag === 'begin') {
+    // Transaction started - track the xid
+    inFlightXids.add(BigInt(message.xid));
+  } else if (message.tag === 'commit') {
+    // Transaction committed - compute snapshot
+    const snapshot = computeSnapshotAfterCommit(xid, inFlightXids);
+    // This snapshot represents "just after this commit"
+  }
+});
+```
+
+### 2. Snapshot Computation
+
+When a transaction commits, we compute a snapshot string representing the database state immediately after:
+
+```typescript
+function computeSnapshotAfterCommit(committedXid, inFlightXids) {
+  const inFlightAfter = new Set(inFlightXids);
+  inFlightAfter.delete(committedXid);
+  
+  // xmax = one past the highest xid we've seen
+  const xmax = max([committedXid, ...inFlightAfter]) + 1n;
+  
+  // xmin = lowest still-in-flight xid, or xmax if none
+  const xmin = inFlightAfter.size > 0 
+    ? min([...inFlightAfter]) 
+    : xmax;
+  
+  // xip = in-flight transactions in range [xmin, xmax)
+  const xip = [...inFlightAfter]
+    .filter(x => x >= xmin && x < xmax)
+    .sort();
+  
+  return `${xmin}:${xmax}:${xip.join(',')}`;
+}
+```
+
+**Snapshot format: `xmin:xmax:xip1,xip2,...`**
+- `xmin`: Oldest transaction still in-progress (or xmax if none)
+- `xmax`: First transaction ID not yet assigned
+- `xip`: List of in-progress transaction IDs
+
+### 3. PostgreSQL C Extension
+
+The `electric_exec_as_of` function:
 
 ```sql
--- Get a point-in-time read
 SELECT electric_exec_as_of(
-    '750:751:'::pg_snapshot,
-    'SELECT * FROM users WHERE id = $1',
-    '["user123"]'::jsonb
+  '762:763:'::pg_snapshot,           -- The historical snapshot
+  'SELECT * FROM users WHERE id=$1', -- Query to execute
+  '["user123"]'::jsonb               -- Parameters
 );
 -- Returns: [{"id": "user123", "name": "Alice", ...}]
 ```
 
-### Docker Image (`docker/Dockerfile`)
+**Implementation:**
 
-Builds a Postgres 16 image with the extension pre-installed. Useful for:
-- CI/CD pipelines
-- Testcontainers-based testing
-- Production deployments
+1. **Parse the snapshot string** into xmin, xmax, and xip array
+2. **Create a custom SnapshotData** structure based on the current transaction's snapshot
+3. **Override MVCC fields** (xmin, xmax, xcnt, xip) with our historical values
+4. **Push the custom snapshot** using `PushActiveSnapshot()`
+5. **Execute the query via SPI** with the snapshot active
+6. **Return results as JSON**
 
-```bash
-# Build the image
-cd electric-snapshot-poc
-docker build -f docker/Dockerfile -t electric-postgres:test .
+```c
+// Create custom snapshot from parsed values
+snap = (Snapshot) MemoryContextAllocZero(TopTransactionContext, size);
+memcpy(snap, base, sizeof(SnapshotData));
 
-# Run with logical replication enabled
-docker run -d \
-  -e POSTGRES_PASSWORD=postgres \
-  -p 5432:5432 \
-  electric-postgres:test \
-  postgres -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10
+snap->xmin = xmin;  // Our historical xmin
+snap->xmax = xmax;  // Our historical xmax
+snap->xip = xip;    // Our in-flight xid list
+snap->xcnt = xcnt;
+
+// Execute with this snapshot
+PushActiveSnapshot(snap);
+ret = SPI_execute(wrapped_sql, true, 0);
+PopActiveSnapshot();
 ```
 
-### Integration Tests (`test/`)
+### 4. MVCC Visibility Rules
 
-TypeScript/Vitest tests that prove the point-in-time read functionality:
+PostgreSQL's MVCC determines tuple visibility using:
 
-1. **Smoke tests**: Basic function execution with current snapshots
-2. **Time travel test**: Proves that old snapshots return old values even after newer commits
-3. **Guardrail tests**: Validates that non-SELECT queries are rejected
-4. **Stress test**: Multiple sequential commits with snapshot verification
+- **xmin**: Transaction that created this tuple version
+- **xmax**: Transaction that deleted/updated this tuple (0 if still current)
 
-## Prerequisites
+A tuple is visible to snapshot S if:
+- `tuple.xmin < S.xmax` AND `tuple.xmin` is committed AND `tuple.xmin` not in `S.xip`
+- AND (`tuple.xmax == 0` OR `tuple.xmax >= S.xmax` OR `tuple.xmax` in `S.xip` OR `tuple.xmax` aborted)
 
-### For Local Development
+By providing a historical snapshot, we see **exactly the tuples that were visible at that point in time**.
+
+## Use Case: ElectricSQL Sync/Auth Validation
+
+This POC demonstrates the foundation for ElectricSQL-style sync validation:
+
+1. **Client syncs data** from a specific point in time
+2. **Server observes commits** via logical replication
+3. **Auth rules need validation** against the data state the client saw
+4. **Use `electric_exec_as_of`** to query with the client's snapshot
+5. **Validate permissions** against historical data, not current data
+
+Example: A user had read access to document X at sync time T1. By T2, their access was revoked. When validating operations from the T1 sync, we query with snapshot T1 to correctly see they DID have access.
+
+## Data Retention: The VACUUM Problem
+
+### Why Old Tuples Might Disappear
+
+PostgreSQL's VACUUM removes "dead" tuple versions that are no longer visible to any active snapshot. Without protection, our historical queries would fail.
+
+### Solution: Replication Slot Retention
+
+Logical replication slots track a `restart_lsn`. PostgreSQL will NOT vacuum tuples that might be needed by any slot:
+
+```sql
+-- Create a slot
+SELECT pg_create_logical_replication_slot('my_slot', 'pgoutput');
+
+-- Check the slot's restart_lsn
+SELECT slot_name, restart_lsn FROM pg_replication_slots;
+```
+
+**By not acknowledging WAL consumption**, the slot's `restart_lsn` stays old, preventing VACUUM from removing tuples needed for historical snapshots.
+
+### Current POC Approach
+
+The tests disable autovacuum:
+```sql
+ALTER TABLE acl SET (autovacuum_enabled = false);
+```
+
+In production, you would:
+1. Keep replication slots for each "active" historical point
+2. Acknowledge WAL only up to the oldest needed snapshot
+3. Clean up slots when snapshots are no longer needed
+
+## Project Structure
+
+```
+/electric-snapshot-poc
+├── ext/electric_poc/           # PostgreSQL C extension
+│   ├── Makefile                # PGXS build file
+│   ├── electric_poc.control    # Extension metadata
+│   ├── electric_poc--0.0.1.sql # SQL function definition
+│   └── electric_poc.c          # C implementation (~300 lines)
+├── docker/
+│   └── Dockerfile              # Postgres 16 + extension image
+├── test/
+│   ├── package.json            # Node.js dependencies
+│   ├── vitest.config.ts        # Test configuration
+│   └── tests/
+│       ├── asof.spec.ts        # Main integration tests (10 tests)
+│       ├── vacuum-proof.spec.ts # Heap examination tests (2 tests)
+│       └── helpers/
+│           ├── postgres.ts     # Database connection helpers
+│           └── replication.ts  # WAL tailing + snapshot computation
+├── .gitignore
+└── README.md
+```
+
+## Running the Tests
+
+### Prerequisites
 
 - PostgreSQL 16 with development headers
+- Node.js 18+
 - Build tools (gcc, make)
-- Node.js 18+
-- npm or pnpm
 
-### For Docker-based Setup
-
-- Docker
-- Node.js 18+
-- npm or pnpm
-
-## Quick Start
-
-### Option 1: Local Postgres Setup
+### Setup
 
 ```bash
-# Install Postgres and development headers (Ubuntu/Debian)
+# Install Postgres (Ubuntu/Debian)
 sudo apt-get install postgresql-16 postgresql-server-dev-16 build-essential
 
 # Build and install the extension
@@ -98,144 +252,96 @@ make && sudo make install
 #   max_replication_slots = 10
 #   max_wal_senders = 10
 
-# Restart Postgres and create test database
+# Restart Postgres
 sudo systemctl restart postgresql
+
+# Create test database
 sudo -u postgres createdb testdb
 
-# Run tests
+# Install test dependencies and run
 cd test
 npm install
 npm test
 ```
 
-### Option 2: Docker Setup
+### Expected Output
 
-```bash
-# Build the Docker image
-docker build -f docker/Dockerfile -t electric-postgres:test .
-
-# Run the container
-docker run -d --name pg-test \
-  -e POSTGRES_PASSWORD=postgres \
-  -e POSTGRES_DB=testdb \
-  -p 5432:5432 \
-  electric-postgres:test \
-  postgres -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10
-
-# Wait for startup
-sleep 5
-
-# Run tests
-cd test
-npm install
-PGPASSWORD=postgres npm test
 ```
+ ✓ tests/asof.spec.ts (10 tests) 4492ms
+   ✓ Test 1 - Smoke test function (3 tests)
+   ✓ Test 2 - As-of hides later commit (1 test)
+   ✓ Test 3 - Guardrails (5 tests)
+   ✓ Test 4 - Stress test (1 test)
 
-## How It Works
+ ✓ tests/vacuum-proof.spec.ts (2 tests) 2613ms
+   ✓ should read old tuple versions after multiple updates
+   ✓ should verify multiple tuple versions exist in heap
 
-### Snapshot Computation from WAL
-
-When tailing the logical replication stream:
-
-1. **On BEGIN**: Add transaction ID (xid) to in-flight set
-2. **On COMMIT**: Compute snapshot representing "just after this commit"
-   - `xmax` = max(committed_xid, remaining_in_flight_xids) + 1
-   - `xmin` = min(remaining_in_flight) or xmax if none
-   - `xip` = sorted list of remaining in-flight xids in range [xmin, xmax)
-   - Format: `xmin:xmax:xip1,xip2,...`
-3. Remove committed xid from in-flight set
-
-### C Extension Implementation
-
-The extension:
-1. Parses the `pg_snapshot` string into xmin, xmax, and xip list
-2. Creates a `SnapshotData` structure with `SNAPSHOT_MVCC` type
-3. Pushes the custom snapshot as active using `PushActiveSnapshot()`
-4. Executes the query via SPI, wrapped in `json_agg(row_to_json(q))`
-5. Pops the snapshot and returns the JSON result
-
-### Snapshot String Format
-
-PostgreSQL's `pg_snapshot` type uses the format: `xmin:xmax:xip1,xip2,...`
-
-- `xmin`: Earliest transaction ID still in-progress at snapshot time
-- `xmax`: First transaction ID not yet assigned at snapshot time
-- `xip`: List of in-progress transaction IDs at snapshot time
+ Test Files  2 passed (2)
+      Tests  12 passed (12)
+```
 
 ## API Reference
 
 ### `electric_exec_as_of(snapshot, sql, args)`
 
-Execute a read-only query under a specific MVCC snapshot.
+Execute a read-only query under a historical MVCC snapshot.
 
-**Parameters:**
-- `snapshot` (pg_snapshot): The MVCC snapshot to use
-- `sql` (text): The SELECT query to execute
-- `args` (jsonb, optional): JSON array of parameter values (default: `'[]'`)
+```sql
+SELECT electric_exec_as_of(
+  snapshot pg_snapshot,  -- Historical snapshot (e.g., '750:751:')
+  sql text,              -- SELECT query with $1, $2 placeholders
+  args jsonb             -- Parameter array: '["value1", "value2"]'
+) RETURNS jsonb;         -- Array of result rows as JSON objects
+```
 
-**Returns:** `jsonb` - Array of result rows as JSON objects
+**Example:**
+
+```sql
+SELECT electric_exec_as_of(
+  '750:751:'::pg_snapshot,
+  'SELECT * FROM users WHERE id = $1 AND active = $2',
+  '["user123", "true"]'::jsonb
+);
+-- Returns: [{"id": "user123", "name": "Alice", "active": true}]
+```
 
 **Errors:**
-- Non-SELECT queries are rejected with an error
-- Malformed snapshots cause parsing errors
-- SPI execution errors are propagated
+- Non-SELECT queries are rejected
+- Malformed snapshot strings cause errors
+- Only text parameters are supported (bound as `TEXTOID`)
 
 ## Limitations
 
 This is a proof-of-concept with known limitations:
 
-- **No subxid support**: Subtransactions are not tracked
-- **Approximate snapshots**: Based on BEGIN/COMMIT observation timing
-- **Vacuum sensitivity**: Requires autovacuum to be disabled/delayed to preserve old tuple versions
-- **Read-only**: Only SELECT queries are allowed
-- **Text parameters**: All parameters are bound as TEXT type
-- **Single-line queries**: No multi-statement support
+| Limitation | Description | Production Consideration |
+|------------|-------------|-------------------------|
+| No subtransaction support | `subxip` is always empty | May miss some edge cases |
+| Approximate snapshots | Based on BEGIN/COMMIT timing | Generally safe, may be slightly conservative |
+| Text-only parameters | All args bound as TEXT | Add type inference for production |
+| No VACUUM handling | Relies on disabled autovacuum | Use replication slot retention |
+| Single-threaded WAL tailing | One stream per test | Scale with multiple consumers |
 
-## Project Structure
+## Key Insights
 
-```
-/electric-snapshot-poc
-  /ext/electric_poc
-    Makefile              # PGXS build file
-    electric_poc.control  # Extension control file
-    electric_poc--0.0.1.sql  # SQL function definitions
-    electric_poc.c        # C implementation
-  /docker
-    Dockerfile            # Postgres + extension image
-  /test
-    package.json          # Node dependencies
-    tsconfig.json         # TypeScript config
-    vitest.config.ts      # Vitest config
-    /tests
-      asof.spec.ts        # Integration tests
-      /helpers
-        postgres.ts       # Database connection helpers
-        replication.ts    # Logical replication helpers
-  README.md
-```
+1. **PostgreSQL MVCC stores multiple tuple versions** - This is the foundation that makes point-in-time queries possible.
 
-## Test Output Example
+2. **Snapshots are just metadata** - A snapshot is just xmin/xmax/xip values that determine visibility rules.
 
-```
- ✓ tests/asof.spec.ts (10 tests) 4508ms
-   ✓ Test 1 - Smoke test function
-     ✓ should execute a simple query with current snapshot
-     ✓ should execute a query with parameters
-     ✓ should return empty array for no matching rows
-   ✓ Test 2 - As-of hides later commit
-     ✓ should return old value when querying with old snapshot
-   ✓ Test 3 - Guardrails
-     ✓ should reject UPDATE queries
-     ✓ should reject INSERT queries
-     ✓ should reject DELETE queries
-     ✓ should reject malformed snapshot strings
-     ✓ should reject snapshot with missing parts
-   ✓ Test 4 - Stress test with multiple commits
-     ✓ should correctly read historical values across multiple commits
+3. **We can construct synthetic snapshots** - By observing transaction commits via WAL, we can build valid snapshots.
 
- Test Files  1 passed (1)
-      Tests  10 passed (10)
-```
+4. **Custom snapshots work with SPI** - The `PushActiveSnapshot` API allows executing queries under any valid snapshot.
+
+5. **Data retention is separate from visibility** - Snapshots control what's *visible*, but we must also ensure old tuples *exist* (via slot retention or disabled vacuum).
+
+## References
+
+- [PostgreSQL MVCC Documentation](https://www.postgresql.org/docs/current/mvcc.html)
+- [pg_snapshot Type](https://www.postgresql.org/docs/current/datatype-pg-snapshot.html)
+- [Logical Replication Protocol](https://www.postgresql.org/docs/current/protocol-logical-replication.html)
+- [SPI (Server Programming Interface)](https://www.postgresql.org/docs/current/spi.html)
+- [pageinspect Extension](https://www.postgresql.org/docs/current/pageinspect.html)
 
 ## License
 
