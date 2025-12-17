@@ -1,0 +1,93 @@
+# Dependencies
+node_modules/
+
+# Build outputs - C extension
+*.o
+*.so
+*.bc
+*.a
+*.dylib
+*.dll
+
+# Build outputs - general
+dist/
+build/
+out/
+
+# Test outputs
+coverage/
+.nyc_output/
+
+# PostgreSQL data and runtime files
+*.pid
+*.lock
+pgdata/
+postgres-data/
+/var/lib/postgresql/
+pg_log/
+pg_wal/
+pg_xlog/
+postmaster.pid
+postmaster.opts
+*.sql.gz
+*.dump
+
+# Replication slots and WAL
+pg_replslot/
+archive_status/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# Environment files
+.env
+.env.local
+.env.*.local
+*.env
+
+# Package manager locks (optional - uncomment to ignore)
+# package-lock.json
+# pnpm-lock.yaml
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# TypeScript cache
+*.tsbuildinfo

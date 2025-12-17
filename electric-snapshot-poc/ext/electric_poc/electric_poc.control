@@ -1,0 +1,5 @@
+# electric_poc extension
+comment = 'POC for point-in-time reads using MVCC snapshots'
+default_version = '0.0.1'
+module_pathname = '$libdir/electric_poc'
+relocatable = true
